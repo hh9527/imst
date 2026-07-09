@@ -1,0 +1,45 @@
+{
+  "packages": [
+    {
+      "name": "node",
+      "items": [
+        {
+          "dest": "",
+          "digest": {
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "kind": {
+            "type": "Archive",
+            "format": "TarGzip",
+            "strip_components": 1
+          },
+          "src": "https://example.invalid/node-v20.tar.gz"
+        },
+        {
+          "dest": "bin/node-helper",
+          "kind": {
+            "type": "BinaryFile"
+          },
+          "src": "https://example.invalid/node-helper"
+        }
+      ]
+    },
+    {
+      "name": "node",
+      "items": [
+        {
+          "dest": "",
+          "digest": {
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          "kind": {
+            "type": "Archive",
+            "format": "TarGzip",
+            "strip_components": 1
+          },
+          "src": "https://example.invalid/node-v22.tar.gz"
+        }
+      ]
+    }
+  ]
+}
