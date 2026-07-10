@@ -1,595 +1,631 @@
-# RFC 0002: Reducer/Effect 与请求文件持续调谐
+# RFC 0002: 两级配置文件持续调谐
 
 ## 摘要
 
-本 RFC 提议建立 `imst daemon` 的第一套持续调谐执行模型，并用用户
-`requests.json` 的观察、重载和 intent 更新验证这套模型。
-
-RFC 0001 把安装描述为一次由入口驱动的流程。本 RFC 改用持续变化的目标和持续变化的
-环境作为输入：daemon 接收 event，以同步 reducer 修改内存 state 并声明 effect；effect
-异步访问外部环境，再把观察结果作为新的 event 投回 daemon。
+本 RFC 提议建立 `imst daemon` 的第一套 reducer/effect 持续调谐模型，并用两级动态配置
+文件验证这套模型：
 
 ```text
-Event
-  -> reduce(State)
-  -> Effects
-  -> async apply(Ctx)
-  -> EventEmitter
-  -> Event
+环境变量
+    -> 单一顶层配置文件
+    -> 动态 WatchList
+    -> 多个用户意图配置文件
+    -> 合并后的 Intent
 ```
 
-本 RFC 不设计完整的安装、prune 或 GC 状态机。它先完成一个较小但完整的纵向切片：
+两个环境变量在 daemon 运行期间不可变：
 
-- 持续观察用户 `requests.json` 的文件状态。
-- 在文件变化时避免重复地并发读取。
-- 保存最后一次成功解析和规整化的数据。
-- 通过确定性的 `data_rev` 判断部署目标是否发生语义变化。
-- 对 intent 更新进行全局 debounce。
-- 以固定 service 和有限 effect 两类异步任务组成 daemon runtime。
+- `IMST_CONFIG` 指向顶层配置文件。
+- `IMST_DATA` 指向 daemon 完全、唯一控制的数据目录。
 
-如果这个模式得到验证，后续 RFC 可以把它继续应用到 `RootConfig`、`WatchList`、
-`DesiredGoals` 和 `InstalledSet` 等更多 state shape。
+环境变量指定的是位置，不保证文件内容不变。顶层配置文件和它订阅的用户意图文件都会
+持续变化。daemon 必须观察变化、保留 last-known-good 数据、在错误修复后自愈，并在顶层
+配置移除订阅时回收该文件的 watch 和 intent contribution。
+
+两类文件共享同一个以 `FileSpec` marker 类型参数化的 `FileState`、`FileEvent` 和
+`FileEffect` 状态机；它们不同的下游调谐仍由顶层 `AnyEvent` 明确路由。
+
+本 RFC 不实现 package 安装、下载、prune 或数据目录 GC。它验证的是这些能力未来需要依赖
+的动态目标、状态调谐和反向回收骨架。
 
 ## 动机
 
-`imst` 的安装不应由一次性的 install command 驱动。管理员配置、系统用户集合、用户自己
-拥有的 `requests.json`、文件系统状态以及 store 内容都会持续变化。daemon 的职责是持续
-观察这些变化，并使自己有权管理的状态向最新目标收敛。
+RFC 0001 把安装描述为一次由命令入口驱动的 action pipeline。这足以验证 package spec、
+revision 和 marker，但不适合 daemon 的长期模型。
 
-长期图景可以简化为：
+`imst` 的输入不是一次性任务，而是持续变化的部署目标。管理员可以修改顶层配置；被订阅
+的用户意图文件也可以独立变化。daemon 应持续使自己的观察和派生状态向这些输入收敛，
+而不是把配置当作消费后删除的命令队列。
 
-```text
-RootConfig
-    -> WatchList
-    -> DesiredGoals
-    -> InstalledSet
-```
+本 RFC 关注以下问题：
 
-这里的箭头不是一次性转换。每一层都可能继续变化，每一条边都需要反复调谐。安装和
-prune 最终会同时出现在 `DesiredGoals -> InstalledSet` 的调谐中。
-
-用户的部署目标来自各用户自己拥有的配置文件。daemon 可以读取和合并这些配置，但没有
-权力修改它们。因此，用户配置不是 daemon 可以消费并删除的任务队列；它是持续存在、
-持续变化的目标来源。
-
-RFC 0001 的同步 action pipeline 足以验证 marker，但不适合直接承担以下行为：
-
-- 文件 watcher 随时产生新观察。
-- 一个外部操作执行期间，其依据的输入可能再次变化。
-- 相同变化不应不断产生重复工作。
-- effect 完成后可能需要立即接续下一次 effect。
-- 多次快速变化应合并为一次下游 intent 更新。
-
-因此，本 RFC 先固定 reducer/effect 模式和第一个文件调谐状态机，不急于设计完整动态 DAG
-或抽象化的状态机框架。
+- 如何区分运行期不可变的 bootstrap 路径和持续变化的文件内容。
+- 如何用同一个状态机加载两种结构化配置文件。
+- 如何区分 effect 已提交和真正开始工作。
+- 如何用 stat 做读取短路优化，而不把 mtime 当作部署目标身份。
+- 如何在加载失败时继续使用 last-known-good 数据。
+- 如何合并频繁文件通知，并在真实加载完成后补一次 force-rescan。
+- 如何由顶层配置的 subscription set 驱动 intent-source 的发现和回收。
 
 ## 指南级说明
 
-daemon runtime 持有唯一的内存 `State`。所有状态修改都通过 `AnyEvent` 的 reducer 完成。
-reducer 不直接访问文件系统、timer 或其他外部环境；它只能修改 state，并向 `Effects`
-中加入具体的 `AnyEffect`。
-
-effect 是有限的异步任务。它通过 `Ctx` 使用外部能力，并通过 `EventEmitter` 投递新的
-event。effect 不能直接访问或修改 `State`。
-
-长期运行的 file watcher 和 update-intent debouncer 不是 effect。它们是由 daemon 顶层
-任务创建和监督的固定 service。effect 可以通过 `Ctx` 中的 sender 预触发这些 service，
-service 则通过 `EventEmitter` 产生 event。
-
-对于一个被观察的 `requests.json`，daemon 维护：
+daemon 启动时读取环境变量：
 
 ```text
-FileState {
-    path,
-    stat,
-    ok,
-    error,
-    updating
+IMST_CONFIG=/etc/imst/config.json
+IMST_DATA=/opt/imst/data
+```
+
+`IMST_CONFIG` 可以指向 JSON 或 TOML 文件。未设置时默认使用 `/etc/imst/config.{json|toml}`；
+具体默认格式选择仍见未决问题。
+
+`IMST_DATA` 未设置时默认为 `/opt/imst/data`。daemon 对该目录具有完全、唯一控制权。初始
+布局假定为：
+
+```text
+/opt/imst/data/
+├── dl/
+├── pkgs/
+└── tmp/
+```
+
+顶层配置通过 `subscribe` 字段声明需要观察的用户意图文件：
+
+```json
+{
+  "subscribe": [
+    "/path/to/user1/intent.json",
+    "/path/to/user2/intent.toml"
+  ]
 }
 ```
 
-当 watcher 发现 stat 变化时，它投递 `StatChanged`。如果新 stat 表示普通文件，并且当前
-没有 reload 在途，reducer 设置 `updating = true` 并声明 `Reload` effect。
+用户意图文件包含 package spec 列表：
 
-`Reload` 完成后必须投递一个 `FileUpdated`。成功结果替换最后一次成功数据并清除错误；
-失败结果保存错误，但不清除最后一次成功数据。effect 操作后的 stat 如果表明还需要继续
-reload，reducer 直接声明下一个 `Reload` 并保持 `updating = true`；否则设置
-`updating = false`。
+```json
+{
+  "packages": [
+    {
+      "name": "foo",
+      "items": []
+    }
+  ]
+}
+```
 
-成功数据包含规整化后的 `RequestSet` 和确定性摘要 `data_rev`。只有 `data_rev` 发生变化
-时，reducer 才声明无 payload 的 `UpdateIntent` effect。
+两种文件均可使用 JSON 或 TOML，格式由文件扩展名决定。文件先反序列化成类型化数据，再
+规整化并计算确定性 revision。输入格式、空白和无语义顺序不直接参与 revision。
 
-`UpdateIntent` effect 不直接启动一个独立 timer。它只通过 `Ctx` 中的 sender 预触发固定
-的 update-intent service。该 service 持有唯一可重置 timer。安静期结束后，service 投递
-一个无 payload 的 `UpdateIntent` event。该 event 从当时最新的 `State` 重新计算合并后的
-intent，而不使用 effect 创建时的旧数据快照。
+file watcher 始终观察顶层配置路径，并动态观察当前 subscription set。文件通知不执行
+stat 或读取，只通过 keyed debounce 投递类型化 `ReloadRequested` event。
+
+`ReloadRequested` 从 `FileState` 快照 `prev_stat` 并声明 reload effect。handler 开始时投递
+`ReloadStarted`，随后执行 stat：
+
+```text
+current_stat == prev_stat
+    -> 短路内容读取
+    -> ReloadFinished { data: None, error: None }
+
+current_stat != prev_stat
+    -> 读取、解析、规整化并计算 revision
+    -> ReloadFinished { data: Some(...) }
+
+加载失败
+    -> ReloadFinished { error: Some(...) }
+```
+
+失败只更新错误观察，不替换 last-known-good stat/data。首次启动时 last-known-good 是合法
+empty 数据；因此顶层配置或单个用户意图文件出错都不会使 daemon OOS。文件修复后，持续
+reload 会自动清除错误并推进有效数据。
+
+顶层配置成功变化时，daemon 调谐 WatchList：新增路径开始观察并初始加载；删除路径停止
+观察并立即退出有效 intent source set。这个反向过程是 RFC 0002 中的 subscription GC。
 
 ## 参考级说明
 
-### 具体类型与分层
+### Bootstrap 与数据目录
 
-本 RFC 不引入开放式 `Event` 或 `Effect` trait。event 和 effect 是 `imst` 内置、封闭、
-可审计的能力集合，使用具体枚举表达。
+```text
+BootstrapConfig {
+    config_path: Path,
+    data_path: Path,
+}
+```
 
-顶层枚举采用 wrapper-style variant：
+`BootstrapConfig` 在 daemon 启动时构造，运行期间不可变。环境变量改变不要求在线生效，
+需要重启 daemon。
+
+`config_path` 和它指向的文件内容必须区分：path 不变，文件内容可变。
+
+`data_path` 指向 daemon-owned 目录。普通用户、顶层配置和用户意图文件都不能直接管理其中
+内容。本 RFC 只固定 `dl`、`pkgs` 和 `tmp` 三个候选子目录，不固定它们的长期布局和 GC
+协议。
+
+### 配置数据类型
+
+```text
+TopConfigData {
+    subscribe: Set<Path>,
+}
+
+UserIntentData {
+    packages: Vec<PackageSpec>,
+}
+
+Versioned<T> {
+    data: T,
+    rev: String,
+}
+```
+
+`TopConfigData.subscribe` 的规整化至少包括：
+
+- path 必须是 UTF-8 absolute path。
+- path 必须 normalized，不包含 `.` 或 `..` segment。
+- 重复 path 去重。
+- 集合使用确定性顺序编码。
+
+`UserIntentData.packages` 保留具有领域语义的顺序。PackageSpec 的具体校验规则可以复用
+RFC 0001，但输入容器改为结构化 JSON/TOML 文件。
+
+两种 empty last-known-good 为：
+
+```text
+TopConfigData { subscribe: {} }
+UserIntentData { packages: [] }
+```
+
+empty 数据具有确定性 revision，是正常有效状态，不是错误或 OOS 状态。
+
+### JSON 与 TOML
+
+格式由扩展名决定：
+
+```text
+.json -> JSON
+.toml -> TOML
+其他  -> UnsupportedFormat error
+```
+
+revision 来自规整化后的类型化数据：
+
+```text
+rev = hash(canonical_encoding(normalized_data))
+```
+
+同一语义数据使用 JSON 或 TOML 表达时必须得到相同 revision。实现可以使用统一 canonical
+JSON 或其他内部确定性编码；不能直接 hash 原始文件字节。
+
+未知字段、字段顺序和具体 canonical encoding 的长期兼容策略留给后续 RFC。本 RFC 的实现
+必须至少保证同一版本程序内结果确定。
+
+### FileSpec
+
+两类文件通过 marker spec 关联 key、data 和规整化规则：
+
+```text
+FileSpec {
+    type Key
+    type Data
+
+    normalize(data: Data) -> Result<Data, FileLoadError>
+}
+
+TopConfigSpec:
+    Key = ()
+    Data = TopConfigData
+
+IntentConfigSpec:
+    Key = Path
+    Data = UserIntentData
+```
+
+Rust 参考 shape：
+
+```rust
+trait FileSpec: Send + 'static {
+    type Key: Clone + Send + 'static;
+    type Data: Default
+        + Serialize
+        + DeserializeOwned
+        + Send
+        + 'static;
+
+    fn normalize(
+        data: Self::Data,
+    ) -> Result<Self::Data, FileLoadError>;
+}
+
+struct TopConfigSpec;
+struct IntentConfigSpec;
+```
+
+`FileSpec` 只抽象文件加载协议，不包含下游领域行为。TopConfig 更新 WatchList、UserIntent
+更新 merged intent，仍由顶层 reducer 分别处理。
+
+### FileState
+
+```text
+FileState<S: FileSpec> {
+    stat: Option<Stat>,
+    stage: LoaderStage,
+    invalidated: bool,
+    value: Versioned<S::Data>,
+    error: Option<FileLoadErrorState>,
+}
+
+LoaderStage = Idle | Submitted | Working
+
+FileLoadErrorState {
+    at: u64,
+    stat: Option<Stat>,
+    error: FileLoadError,
+}
+```
+
+`stat` 是当前 last-known-good 数据对应的文件状态。只有成功接受新数据时才推进。失败不能
+推进 `stat`，否则后续 reload 可能错误短路，阻止自动恢复。
+
+`stage` 语义：
+
+- `Idle`：没有 loader 工作。
+- `Submitted`：reload effect 已提交，但 handler 尚未开始。
+- `Working`：handler 已经开始执行。
+
+本 RFC 保留这三个 variant，不设计取消、Retiring 或 operation identity。
+
+`invalidated` 表示 Submitted/Working 期间又到达一个 `ReloadRequested`。该请求必须重新
+进入 debounce 队列，所以 `invalidated == true` 同时保证已经存在后续 pending request。
+
+### FileEvent 与 FileEffect
+
+```text
+FileEvent<S: FileSpec> =
+    ReloadRequested {
+        key: S::Key,
+    }
+  | ReloadStarted {
+        key: S::Key,
+    }
+  | ReloadFinished {
+        key: S::Key,
+        at: u64,
+        stat: Option<Stat>,
+        error: Option<FileLoadError>,
+        data: Option<Versioned<S::Data>>,
+    }
+
+FileEffect<S: FileSpec> =
+    Reload {
+        key: S::Key,
+        path: Path,
+        prev_stat: Option<Stat>,
+    }
+```
+
+顶层保持封闭：
 
 ```text
 AnyEvent =
-    File(FileEvent)
+    TopConfig(FileEvent<TopConfigSpec>)
+  | IntentConfig(FileEvent<IntentConfigSpec>)
   | Intent(IntentEvent)
 
 AnyEffect =
-    File(FileEffect)
-  | Intent(IntentEffect)
+    TopConfig(FileEffect<TopConfigSpec>)
+  | IntentConfig(FileEffect<IntentConfigSpec>)
+  | FileWatch(FileWatchEffect)
+  | DebouncedKeyEvent {
+        key: String,
+        timeout: Duration,
+        event: Box<AnyEvent>,
+    }
 ```
 
-第二层领域枚举采用 named-field variant：
+`TopConfigSpec::Key = ()`，因为系统只有一个顶层配置文件，其 path 来自 bootstrap。
+`IntentConfigSpec::Key = Path`，因为 subscription path 是多个用户意图状态的稳定身份。
 
-```text
-FileEvent =
-    StatChanged {
-        path: Path,
-        stat: FileStat,
-    }
-  | FileUpdated {
-        path: Path,
-        stat: FileStat,
-        result: Result<FileOk, FileUpdateError>,
-    }
-
-FileEffect =
-    Reload {
-        path: Path,
-    }
-
-IntentEvent =
-    UpdateIntent {}
-
-IntentEffect =
-    UpdateIntent {}
-```
-
-实际实现可以为第二层类型提供 `From` 实现，以减少包装噪声，但 reducer 和 effect executor
-最终只需要处理 `AnyEvent` 和 `AnyEffect` 两个封闭集合。
-
-本 RFC 刻意不提取通用 reducer/effect 框架。后续 shape 应先沿用具体类型模式，只有在出现
-真实、稳定的重复后才考虑抽象。
-
-### Reducer
+### Event 与 Effect 边界
 
 `AnyEvent` 提供同步 reducer：
 
 ```text
-AnyEvent.reduce(
-    self,
-    state: &mut State,
-    effects: &mut Effects,
+AnyEvent.reduce(self, state: &mut State, effects: &mut Effects)
+```
+
+只有 reducer 可以修改 State。reducer 不访问文件系统、timer 或网络。
+
+`AnyEffect` 提供异步 handler：
+
+```text
+async AnyEffect.apply(self, emitter: EventEmitter, ctx: &Ctx)
+```
+
+effect 和 service 不能直接修改 State，只能投递 event。
+
+`EventEmitter` 支持 immediate 和 keyed debounced 投递：
+
+```text
+EventEmitter.emit(event)
+
+EventEmitter.emit_debounce(
+    event,
+    timeout,
+    key,
 )
 ```
 
-其中：
+sender 支持共享并发投递，因此方法使用 `&self` 即可。`DebouncedKeyEvent` effect 的 apply
+只调用 `EventEmitter::emit_debounce`，不自行 sleep。
 
-- `State` 是 daemon 的 reducer-owned 内存状态。
-- `Effects` 是本次 reduce 新声明的有限 effect 集合。
-- reducer 必须同步完成。
-- reducer 不执行文件 IO、等待 timer 或访问网络。
-- reducer 是修改 `State` 的唯一入口。
-- event 没有返回值。
+### Keyed debounce
 
-IPC/RPC 不属于本 RFC。未来如果请求响应语义需要编译期保证，可以单独增加
-`ReduceWithReply`，而不改变本 RFC 的普通 event 模型。
-
-### Effect 与 EventEmitter
-
-`AnyEffect` 提供异步执行入口：
+固定 debounce service 为每个 String key 保存：
 
 ```text
-async AnyEffect.apply(
-    self,
-    emitter: EventEmitter,
-    ctx: &Ctx,
-)
-```
-
-`EventEmitter` 提供简单的事件投递能力：
-
-```text
-EventEmitter.emit(event: AnyEvent)
-```
-
-初始实现可以使用 Tokio unbounded MPSC channel。`EventEmitter` 持有可 clone 的 sender，
-daemon 顶层任务持有唯一 receiver。
-
-effect 可以产生零个、一个或多个 event。业务失败也必须通过 event 返回 reducer，不通过
-effect 直接修改状态。effect task 的 panic 或取消属于 runtime 故障，不等同于业务失败。
-
-`Ctx` 提供 effect 所需的外部能力和固定 service 的触发入口。它不保存领域真相，也不能
-向 effect 暴露可变 `State`。
-
-### State shape
-
-本 RFC 只固定验证文件调谐所需的 state：
-
-```text
-State {
-    files: Map<Path, FileState>,
-    intent: IntentState,
-}
-
-FileState {
-    path: Path,
-    stat: FileStat,
-    updating: bool,
-    ok: Option<FileOk>,
-    error: Option<FileUpdateError>,
-}
-
-FileStat {
-    mtime: SystemTime,
-    ty: FileType,
-}
-
-FileOk {
-    data: RequestSet,
-    rev: DataRev,
+Pending {
+    deadline,
+    event,
 }
 ```
 
-`FileType` 至少能够区分普通文件和其他文件类型：
+相同 key 的新请求替换 event，并使用最新 timeout 重置 deadline；不同 key 独立。deadline
+到期后删除 pending slot，并把最后一个 event 投回 immediate event queue。
+
+建议 key：
 
 ```text
-FileType = RegularFile | Directory | Symlink | Other
+config:reload
+intent-config:reload:<normalized-path>
+intent:update
 ```
 
-`stat` 是最近一次被 reducer 接受的路径观察。WatchList 如何首次创建 `FileState`、路径
-不存在如何表达、stat 失败如何表达，不在本 RFC 中最终固定；实现验证可以由初始化代码
-创建 state，并只投递成功的 stat observation。
+key 只承担 runtime 分组，不表达领域类型。领域类型由 `AnyEvent` variant 保证。key 只能由
+daemon 内部生成，不能直接来自不可信输入。
 
-`ok` 是最后一次成功读取、解析和规整化的数据，不保证对应当前 `stat`。更新失败时必须
-保留 `ok`，使暂时的读取或解析错误不会立即撤销上一次有效部署目标。
+### 通用 loader 状态机
 
-`error` 是最后一次 reload 失败。reload 成功时必须清除它。错误的长期分类、展示和重试
-策略不在本 RFC 中固定。
+`ReloadRequested`：
 
-`updating` 表示当前存在负责使文件数据追赶最新 stat 的 reload 工作。它不是某个 task 的
-持久化 ID。本 RFC 依靠每个 `FileState` 同时最多一个 reload effect 的约束使用 boolean；
-如果后续需要处理删除后重建或更复杂的过时 completion，可以扩展为 operation ID。
-
-### DataRev
-
-`FileOk.data` 是解析、校验并规整化后的领域对象，不是文件原始字节。
-
-```text
-data_rev = deterministic_hash(canonical_encoding(data))
-```
-
-本 RFC 要求：
-
-- 相同规整化数据得到相同 `data_rev`。
-- 仅 JSON 空白或其他无语义表示差异不改变 `data_rev`。
-- `data` 和 `data_rev` 必须成对更新。
-- `data_rev` 必须能够从 `data` 独立重算。
-- `mtime` 不参与 `data_rev`。
-
-本 RFC 可以沿用 RFC 0001 的紧凑 canonical JSON 与 SHA-256 作为验证算法，但不进一步固定
-长期 canonical encoding。`RequestSet` 中哪些顺序具有语义，必须由其领域类型决定，不能
-为了摘要稳定而任意重排具有行为含义的 item。
-
-### StatChanged
-
-`StatChanged` 表示 file watcher 得到一个新的路径观察：
-
-```text
-StatChanged {
-    path,
-    stat,
-}
-```
-
-reducer 首先比较完整 `FileStat`，而不只比较 mtime。文件类型可能在 mtime 相同的情况下
-发生变化。
-
-状态迁移为：
-
-| 条件 | 状态变化 | Effect |
+| Stage | 状态变化 | Effect |
 | --- | --- | --- |
-| `new_stat == state.stat` | 无 | 无 |
-| stat 变化且不是普通文件 | 更新 `stat` | 无 |
-| stat 变化、是普通文件且 `updating` | 更新 `stat` | 无 |
-| stat 变化、是普通文件且 `!updating` | 更新 `stat`，设置 `updating = true` | `Reload` |
+| Idle | stage=Submitted, invalidated=false | `Reload { prev_stat: state.stat }` |
+| Submitted | invalidated=true | 重新 debounce 同一个 ReloadRequested |
+| Working | invalidated=true | 重新 debounce 同一个 ReloadRequested |
 
-这里的 `updating` 用于避免 watcher 的重复 observation 产生并发 reload。reload 在途时仍要
-接受更新的 stat，使当前 effect 完成后能够判断是否需要继续追赶。
+`ReloadStarted` 只允许在 Submitted，迁移到 Working。
 
-### Reload effect
+handler 必须先投递 `ReloadStarted`，再执行 stat 和可选读取，最后恰好投递一个
+`ReloadFinished`。同一个 producer 的事件顺序必须保持。
 
-`Reload` 是有限 effect：
+`ReloadFinished` 合法组合：
 
-```text
-Reload {
-    path,
-}
-```
-
-它负责：
-
-1. 打开文件。
-2. 从打开后的文件句柄获取 metadata。
-3. 读取完整内容。
-4. 解析并校验 `RequestSet`。
-5. 把数据规整化并计算 `data_rev`。
-6. 在操作完成后获取用于调谐的 `FileStat`。
-7. 投递且只投递一个 `FileUpdated`。
-
-打开文件会固定所引用的 inode，但不会冻结原地修改的内容。实现应至少比较读取前后的文件
-metadata；如果读取期间文件版本发生变化，应返回失败结果或重新读取，不能把可能混合的
-内容作为成功数据发布。
-
-`Reload` 被成功提交后，runtime 必须保证 reducer 最终收到一个 `FileUpdated`。普通 IO、
-解析或校验失败由 `FileUpdated(Err)` 表达。task panic、abort 或 daemon shutdown 的处理属于
-runtime failure model；实现不能在 daemon 继续运行时让对应 `FileState.updating` 永久为
-`true`。
-
-### FileUpdated
-
-`FileUpdated` 是 `Reload` 的 completion event：
-
-```text
-FileUpdated {
-    path,
-    stat,
-    result,
-}
-```
-
-它只允许在对应 `FileState.updating == true` 时发生。正常运行中在 `updating == false` 时
-收到该事件属于非法迁移。
-
-处理 `result`：
-
-- `Ok(new_ok)`：比较旧、新 `data_rev`，以 `new_ok` 替换 `ok`，并清除 `error`。
-- `Err(new_error)`：以 `new_error` 替换 `error`，并保留原有 `ok`。
-
-处理 effect 操作后的 `stat`：
-
-- reducer 先比较 completion 携带的 `stat` 与 state 中已经接受的当前 `stat`。
-- 如果两者不同，并且 completion stat 是普通文件，则满足 reload 触发条件；reducer 更新
-  `stat`，立即声明下一个 `Reload`，并保持 `updating = true`。
-- 如果 stat 不满足 reload 触发条件，设置 `updating = false`，表达当前 effect 链已经完成。
-
-`FileUpdated` 判断 reload 时不应用 `!updating` 条件，因为该事件必然发生在
-`updating == true`，并且当前 effect 正在完成。此处的决定是让新 effect 接替当前 effect，
-而不是与当前 effect 并发。
-
-因此 completion 可以形成两种迁移：
-
-```text
-Updating -- FileUpdated, requires reload --> Updating
-Updating -- FileUpdated, otherwise       --> Idle
-```
-
-不得先无条件设置 `updating = false` 再重新设置为 true。当前 effect 的完成与下一个 effect
-的接替应作为一次 reducer 转换完成。
-
-状态迁移为：
-
-| Event | 条件 | 状态变化 | Effect |
+| stat | error | data | 语义 |
 | --- | --- | --- | --- |
-| `FileUpdated(Ok)` | stat 需要继续 reload | 更新 stat/ok，清除 error，保持 updating | `Reload` |
-| `FileUpdated(Err)` | stat 需要继续 reload | 更新 stat/error，保留 ok，保持 updating | `Reload` |
-| `FileUpdated(Ok)` | stat 不需要继续 reload | 更新 stat/ok，清除 error，设置 updating=false | 无 |
-| `FileUpdated(Err)` | stat 不需要继续 reload | 更新 stat/error，保留 ok，设置 updating=false | 无 |
+| 与 prev_stat 相同 | None | None | stat 短路，未读取 |
+| None | Some | None | stat 失败 |
+| Some | None | Some | 加载成功 |
+| Some | Some | None | stat 后的类型、读取、解析或校验失败 |
 
-`FileUpdated(Ok)` 还要比较旧、新 `data_rev`：
+以下组合非法：
 
-| 旧 revision | 新结果 | Intent effect |
-| --- | --- | --- |
-| `None` | `Ok(rev1)` | `UpdateIntent` |
-| `rev1` | `Ok(rev1)` | 无 |
-| `rev1` | `Ok(rev2)` | `UpdateIntent` |
-| `rev1` | `Err` | 无 |
-| `None` | `Err` | 无 |
+- data 和 error 同时为 Some。
+- stat 为 None 但 data 为 Some。
+- stat、error、data 同时为 None。
 
-同一个 completion 可以同时声明 `Reload` 和 `UpdateIntent`。这表示当前成功数据先向下游传播，
-文件观察同时继续追赶更新版本。
+completion 只允许在 Working，完成后进入 Idle 并清除 invalidated。
 
-### UpdateIntent debounce
+结果应用：
 
-`UpdateIntent` effect 和 event 都不包含 payload：
+- `data=Some`：推进 last-known-good stat/value，清除 error。
+- `error=Some`：保留 last-known-good stat/value，只替换 error observation。
+- short-circuit：不修改 stat/value/error。
 
-```text
-IntentEffect::UpdateIntent {}
-IntentEvent::UpdateIntent {}
-```
+force-rescan：
 
-effect 不携带 path、`data_rev` 或数据快照。它只通过 `Ctx` 中的 sender 向固定
-update-intent service 发送一次预触发信号：
+- completion 未 invalidated 且不是 short-circuit 时，debounce 一个 ReloadRequested。
+- completion 已 invalidated 时不重复投递，因为 busy request 已保证 pending reload 存在。
+- short-circuit 不主动 force-rescan，避免稳定文件形成无限循环。
 
-```text
-UpdateIntentEffect.apply
-    -> ctx.update_intent_tx.send(now)
-```
+### 顶层配置调谐
 
-service 持有 receiver 和唯一 timer，状态为：
+file watcher 固定观察 `BootstrapConfig.config_path`。启动和文件通知都使用：
 
 ```text
-Idle
-  -- trigger --> Armed(deadline)
-
-Armed(deadline)
-  -- trigger --> Armed(new_deadline)
-  -- timer   --> emit UpdateIntentEvent -> Idle
+emit_debounce(
+    TopConfig::ReloadRequested { key: () },
+    config_reload_timeout,
+    "config:reload",
+)
 ```
 
-Tokio 实现应使用一个长期 task、MPSC receiver 和 pinned `tokio::time::Sleep`。收到新 trigger
-时，通过 `Sleep::reset(last_trigger + delay)` 重置 deadline。多个已经排队的 trigger 可以
-合并，只保留最新触发时间。
+TopConfig 加载失败只更新 error，当前 subscription roots 不变。
 
-timer 与 trigger 同时 ready 时，应优先处理 trigger，避免在新的变化刚到达时过早发出
-event。实现可以使用带优先顺序的 `tokio::select!`。
+TopConfig 加载成功且 revision 变化时，reducer 用新 subscribe set 替换 WatchList，并声明
+FileWatch reconcile effect。
 
-timer 到期后，service 投递无 payload 的 `UpdateIntentEvent`，然后重新进入 Idle。已完成的
-`Sleep` 不能直接在下一轮复用，否则它会持续立即 ready。
+### WatchList 与 subscription GC
 
-`UpdateIntentEvent` 从 reducer 当时持有的全部最新 `FileState.ok` 重新计算 intent。它不使用
-触发 effect 时的数据，因此无需携带 revision，也不需要处理 effect payload 过时问题。
+```text
+WatchList = current TopConfigData.subscribe
+```
 
-本 RFC 只要求 event 能够被正确 debounce 和投递。多用户 intent 的最终合并 shape、冲突
-规则和 provenance 表达留给后续 RFC。
+新增 path：
+
+- 在 `intent_configs` 中创建 empty `FileState<IntentConfigSpec>`，或复用已有缓存 state。
+- 向 file watcher 注册 path。
+- debounce 初始 `IntentConfig::ReloadRequested`。
+
+删除 path：
+
+- 从有效 WatchList 移除。
+- 从 file watcher 注销 path。
+- 立即从 merged intent source set 排除。
+- 迟到的 ReloadRequested 首先检查 WatchList，不在集合中则 Noop。
+- 已经 Working 的结果可以完成，但不能重新贡献到 merged intent。
+
+这构成 subscription GC：TopConfig subscription set 是 intent-source root set。daemon 不删除
+用户拥有的配置文件，也不在本 RFC 中删除 `IMST_DATA` 下的 package 或 download。
+
+### 用户意图调谐
+
+每个 WatchList path 使用：
+
+```text
+FileEvent<IntentConfigSpec>
+FileEffect<IntentConfigSpec>
+FileState<IntentConfigSpec>
+```
+
+用户意图加载失败只更新该 source 的 error，保留其 last-known-good value。其他 source 和
+daemon 全局服务不受影响。
+
+用户意图加载成功且 revision 变化时，reducer debounce 无 payload `UpdateIntentEvent`：
+
+```text
+DebouncedKeyEvent {
+    key: "intent:update",
+    timeout: intent_update_timeout,
+    event: UpdateIntentEvent,
+}
+```
+
+### Merged Intent
+
+`UpdateIntentEvent` 只读取当前 WatchList 中各 source 的 last-known-good value：
+
+```text
+IntentState {
+    sources: Map<Path, Versioned<UserIntentData>>,
+    rev: String,
+}
+```
+
+本 RFC 先按 source 保存合并视图，不解决不同文件中同名 package 的冲突、依赖或版本求解。
+WatchList 删除 path 时，即使缓存 state 仍存在，该 path 也不能进入 IntentState。
 
 ### Runtime 与任务监督
 
-daemon 顶层任务持有两个 `JoinSet`：
-
 ```text
 top
-├── effects
-└── services
-    ├── update_intent
-    └── file_watcher
+├── event loop + State
+├── effects: JoinSet
+└── services: JoinSet
+    ├── file_watcher
+    └── keyed_debouncer
 ```
 
-顶层任务自己持有 event receiver、`State` 和 reducer loop。它每次取出一个 `AnyEvent`，同步
-reduce，随后把本次声明的 `AnyEffect` 作为有限任务加入 effects `JoinSet`。
+effect 是有限任务，正常完成是预期行为。service 是长期任务，正常运行期间意外返回或 panic
+必须由 top 识别为 service failure。
 
-两类任务具有不同完成语义：
-
-- effect task 是有限任务，正常完成是预期行为。业务失败应通过 event 返回。
-- service task 是长期任务，daemon 正常运行期间不应自行返回。意外返回或 panic 必须由
-  top 识别为 service failure，并决定终止或重启。
-
-`file_watcher` service 持有文件系统 watcher，并把观察转换为 `StatChanged`。
-`update_intent` service 持有 debounce receiver 和 timer，并产生 `UpdateIntentEvent`。
-
-`Ctx` 至少向 effect 暴露：
-
-```text
-Ctx {
-    update_intent_tx,
-    file_watcher_tx,
-    ... effect capabilities
-}
-```
-
-sender 可以在内部使用并发安全的可变状态，但这些状态只属于 runtime mechanism，不属于
-领域 `State`。
-
-daemon shutdown 时，top 负责停止接受新工作、关闭 service 输入并等待或终止两个
-`JoinSet`。完整优雅退出协议不在本 RFC 中固定。
+top 持有 immediate event receiver、State 和 reducer loop。每次 reduce 后，把声明的具体
+AnyEffect 加入 effects JoinSet。
 
 ## 不变量
 
-实现必须维持：
-
-1. 只有 reducer 可以修改 `State`。
-2. effect 和 service 不能直接修改 `State`，只能投递 event。
-3. reducer 不访问文件系统、timer、网络或其他外部环境。
-4. 每个 `FileState` 同时最多存在一个 reload effect 链。
-5. `updating == true` 表示 reload effect 链仍在负责追赶最新 stat。
-6. `FileUpdated` 只能在 `updating == true` 时被接受。
-7. reload 成功会原子地替换 `ok.data` 与 `ok.rev`，并清除 `error`。
-8. reload 失败会更新 `error`，但不会清除最后一次成功的 `ok`。
-9. `ok.rev` 必须能够由规整化后的 `ok.data` 确定性重算。
-10. mtime 或 JSON 表示变化但 `data_rev` 不变时，不触发 intent 更新。
-11. `data_rev` 变化时触发无 payload 的 `UpdateIntent` effect。
-12. 所有 `UpdateIntent` effect 预触发同一个固定 debounce service。
-13. 一个 debounce 安静期只产生一次无 payload 的 `UpdateIntentEvent`。
-14. `UpdateIntentEvent` 始终基于 reducer 当时的最新 state 计算，而不基于旧 effect payload。
+1. BootstrapConfig 在 daemon 运行期间不变。
+2. IMST_DATA 下内容只由 daemon 管理。
+3. 只有 reducer 可以修改 State。
+4. effect 和 service 只能通过 EventEmitter 返回观察。
+5. 两类文件使用同一 FileState/FileEvent/FileEffect 状态机。
+6. 每个 FileState 同时最多有一个 reload handler。
+7. LoaderStage 只按 Idle -> Submitted -> Working -> Idle 迁移。
+8. Reload effect 必须携带 reducer 快照的 prev_stat。
+9. 文件失败不能替换 last-known-good stat/value。
+10. TopConfig 失败不能撤销 subscription roots。
+11. UserIntent 失败不能撤销该 source 的最后有效贡献。
+12. 只有成功 TopConfig 数据可以改变 WatchList。
+13. Merged Intent 只能包含当前 WatchList 中的 source。
+14. 同 key debounce 只投递安静期内最后一个 event。
+15. short-circuit completion 不触发 force-rescan。
+16. 非 short-circuit completion 必须确保一次后续 reload：自行 force-rescan，或复用已经
+    pending 的 invalidated request。
 
 ## 验收标准
 
-本 RFC 的实现被认为完成，当且仅当满足：
-
-1. runtime 使用具体的两层 `AnyEvent`/领域 event 和 `AnyEffect`/领域 effect 枚举。
-2. top 持有独立的 effects 和 services `JoinSet`。
-3. file watcher 和 update-intent debouncer 作为固定 service 运行。
-4. 相同 `FileStat` 的重复 `StatChanged` 不产生 reload。
-5. 非普通文件的 stat 变化不产生 reload。
-6. 普通文件 stat 变化且未在更新时，产生一个 reload 并设置 `updating = true`。
-7. reload 在途时的 stat 变化被 state 接受，但不会并发产生第二个 reload。
-8. `FileUpdated` 只在 `updating == true` 时接受。
-9. `FileUpdated` 发现仍需 reload 时，保持 updating 并直接接续下一个 reload。
-10. `FileUpdated` 不需要继续 reload 时，设置 `updating = false`。
-11. reload 成功保存规整化数据和确定性 `data_rev`，并清除旧错误。
-12. reload 失败保存错误，同时保留最后一次成功数据。
-13. 首次成功数据和变化后的 `data_rev` 产生 `UpdateIntent` effect。
-14. 相同 `data_rev` 的重复成功读取不产生 `UpdateIntent` effect。
-15. 连续预触发 update-intent service 会不断重置唯一 timer。
-16. debounce 安静期结束后只投递一次无 payload 的 `UpdateIntentEvent`。
-17. reducer 转移、reload 接续和 Tokio paused-time debounce 行为具有自动化测试。
+1. 支持从环境变量构造不可变 BootstrapConfig，并提供约定默认值。
+2. 初始化并独占管理 IMST_DATA/{dl,pkgs,tmp}。
+3. JSON 和 TOML TopConfig 能解析为相同类型化数据和 revision。
+4. JSON 和 TOML UserIntent 能解析为相同类型化数据和 revision。
+5. TopConfig 和 UserIntent 使用 FileSpec 参数化的公共状态机。
+6. loader stage 能观察 Idle、Submitted 和 Working。
+7. prev_stat 相同时 handler 不读取文件内容。
+8. 加载失败保留 last-known-good，并持续提供重试和自愈路径。
+9. 首次加载失败时 empty last-known-good 使 daemon 继续运行。
+10. TopConfig subscription 新增 path 后开始 watch 并初始加载。
+11. TopConfig subscription 删除 path 后停止 watch，并从 IntentState 排除。
+12. TopConfig 加载错误不改变当前 WatchList。
+13. 单个 UserIntent 加载错误不影响其他 source。
+14. keyed debounce 支持独立 key、独立 timeout 和替换 pending event。
+15. FileWatch notification 不执行 stat 或读取，只 debounce ReloadRequested。
+16. 非短路 completion 补一次 force-rescan，短路 completion 正常结束。
+17. reducer 转移、stat 短路、last-known-good、subscription GC 和 Tokio paused-time debounce
+    具有自动化测试。
 
 ## 与 RFC 0001 的关系
 
 RFC 0001 仍然是 package spec、revision、installed identity 和 marker 的历史验证。RFC 0002
 不要求保留其一次性 action pipeline 作为长期 daemon 架构。
 
-本 RFC 不立即删除 RFC 0001 的实现，也不定义如何把已有安装 action 迁移成 event/effect。
-后续安装状态机可以复用 RFC 0001 中仍然成立的领域约束，但应运行在本 RFC 建立的持续调谐
-模型之上。
+后续安装状态机可以复用 RFC 0001 中仍然成立的 PackageSpec 约束，但必须以本 RFC 的
+Merged Intent 作为持续变化的目标输入。
 
-若两者在执行架构上冲突，以 RFC 0002 的 reducer/effect 与 daemon runtime 模型作为后续
-设计方向；RFC 0001 的同步流程只视为早期验证入口。
+RFC 0001 的 `<store>/installed` 验证布局不构成本 RFC 的长期承诺。本 RFC 使用
+`IMST_DATA/{dl,pkgs,tmp}` 作为后续设计起点。
 
 ## 缺点
 
-- 本 RFC 只验证一个文件调谐 shape，尚不能完成多用户部署或共享安装。
-- boolean `updating` 依赖每个文件最多一个 reload 链的约束，尚未提供通用 operation ID。
-- unbounded event channel 缺少 backpressure。
-- 固定 debounce service 增加了 runtime 生命周期管理。
-- 保留最后成功数据意味着错误配置可能继续维持旧目标，需要后续状态观察接口清楚展示。
+- 泛型 FileSpec/FileEvent/FileEffect 增加 Rust 类型复杂度。
+- JSON/TOML 双格式需要统一 canonical revision，不能直接 hash 原始文件。
+- unbounded event channel 初期缺少 backpressure。
+- invalid 配置会保持旧目标，管理员必须通过状态观察发现错误。
+- subscription GC 只回收观察和 intent contribution，不回收 package 数据。
 - 本 RFC 没有解决 daemon crash 后内存 state 的恢复。
 
 ## 理由与替代方案
 
-### 为什么使用具体枚举而不是 trait
+### 为什么使用 FileSpec marker
 
-`imst` 的 event 和 effect 是封闭能力集合，不是插件接口。具体枚举能提供穷尽匹配、统一
-日志、简单的异构队列和明确的审计边界，也避免 trait object、类型擦除和 object safety
-问题。
+`FileEvent<TopConfigSpec>` 和 `FileEvent<IntentConfigSpec>` 直接表达领域角色，同时允许复用
+相同加载协议。它比 `FileEvent<()>` 或 `FileEvent<Path>` 更易读，也避免给通用基础类型实现
+领域 trait。
 
-### 为什么 effect 通过 EventEmitter 返回
+### 为什么顶层仍使用 AnyEvent/AnyEffect
 
-外部操作可能产生零个、一个或多个观察结果，长期 service 也需要持续投递 event。
-`EventEmitter` 让它们共享同一个单向反馈入口，并允许多个异步任务并发投递，而不暴露
-`State`。
+系统能力集合应保持封闭、可穷尽匹配。泛型只复用文件加载机械部分，不隐藏 TopConfig 与
+UserIntent 不同的下游行为。
 
-### 为什么不让每个 UpdateIntent effect 自己 sleep
+### 为什么失败保留 last-known-good
 
-每次变化各自创建 timer 只能过滤过时结果，不能形成真正的单一 trailing-edge debounce。
-固定 service 持有唯一 timer；所有 effect 只发送 reset 信号，能明确保证安静期只产生一次
-event，并避免持续创建和取消 timer task。
+外部文件可能处于写入中、暂时不可读或包含错误。把失败解释为空目标会错误触发
+subscription GC 或未来 package prune。失败只更新诊断信息，修复后由持续 reload 自愈。
 
-### 为什么保留最后一次成功数据
+### 为什么 completion 后 force-rescan
 
-用户可能正在重写配置，文件也可能暂时不可读。一次瞬时错误不应自动等价为用户撤销全部
-部署目标，尤其不能因此直接引发未来的 prune。保留 `ok` 可以让系统继续使用最后已知有效
-目标，同时通过 `error` 暴露新版本的问题。
+真实加载期间文件可能再次变化。完成后补一个 debounced reload，可以替代 file watcher 的
+专用 ForceRescan。stat 未变化时下一次 handler 会短路，因此不会形成持续读取循环。
 
-### 为什么本 RFC 不设计通用动态 DAG
+### 为什么 key 使用 String
 
-当前只有一个得到充分讨论的 state shape。先以具体 reducer/effect 验证持续调谐、在途工作
-和 debounce，能让后续抽象来自真实重复，而不是预先猜测完整 DAG 的节点和传播协议。
+key 只表达 debounce 等价分组，真正领域类型由被包装的 AnyEvent 表达。内部 namespaced
+String 足够，并允许未来 shape 复用同一 service。
 
 ## 未决问题
 
-- `FileState` 的初始、missing 和 stat-failed 状态最终如何表达？
-- file watcher 如何接收动态 watch/unwatch 指令？
-- `Reload` 如何精确定义读取期间文件版本稳定性的 metadata tuple？
-- `FileUpdated` 的非法迁移在 production 中应 panic、忽略还是转化成 runtime error？
-- effect task panic 或取消时，如何保证 `updating` 不永久停留为 true？
-- update-intent debounce 的默认时长和配置入口是什么？
-- `UpdateIntentEvent` 最终如何合并多用户数据并保留 provenance？
-- daemon 的优雅退出和 service 重启策略是什么？
+- `/etc/imst/config.{json|toml}` 未显式设置时如何选择；两者同时存在是否报错？
+- JSON/TOML 未知字段应拒绝还是忽略？
+- canonical encoding 的长期版本化协议是什么？
+- Stat 需要包含 mtime 之外的哪些字段？
+- FileWatch 丢失通知时，周期性全量 rescan 如何实现？
+- effect task panic 或取消时，如何避免 stage 永久停留在 Submitted/Working？
+- subscription path 移除时，Submitted/Working handler 的具体收尾策略是什么？
+- daemon 优雅退出和 service 重启策略是什么？
 
 ## 未来可能性
 
-后续 RFC 可以沿用本 RFC 的模式继续设计：
-
-- RootConfig 的持续观察和用户组解析。
-- WatchList 的动态 watch/unwatch 调谐。
-- 多用户 DesiredGoals 的合并与来源追踪。
-- InstalledSet 的 realize、repair 和 prune 状态机。
-- 下载缓存和 installed object 的独立生命周期。
-- GC 策略和反向调谐。
-- IPC 查询、状态订阅和 `ReduceWithReply`。
-- runtime backpressure、effect cancellation 和 operation identity。
+- 基于 UID、用户组和 HOME 扫描产生额外 subscription roots。
+- IPC 查询、状态订阅和管理接口。
+- Merged Intent 到 InstalledSet 的 realize/prune 状态机。
+- 下载缓存和 package object 的独立 GC。
+- effect backpressure 和更完整的 runtime supervision。
