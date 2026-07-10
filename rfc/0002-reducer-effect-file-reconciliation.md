@@ -96,11 +96,13 @@ RFC 0002 首版只支持 JSON 配置。`IMST_CONFIG` 未设置时默认使用 `/
 两种文件在 RFC 0002 首版均使用 JSON。文件先反序列化成类型化数据，完成领域校验和结构
 复用，再计算确定性 digest。输入空白和无语义顺序不直接参与 digest。
 
-file watcher 始终观察顶层配置路径，并动态观察当前 subscription set。文件通知不执行
-stat 或读取，只通过 keyed debounce 以 5 秒 timeout 投递类型化 `ReloadRequested` event。
+file watcher 始终观察顶层配置路径，并动态观察当前 subscription set。写入端推荐先完整
+写入同目录临时文件，再用 rename/move 原子替换目标文件。watcher 因此观察目标的父目录并
+按文件名过滤，而不是只 watch 可能被替换的旧 inode。文件通知不执行 stat 或读取，只通过
+keyed debounce 以 5 秒 timeout 投递类型化 `ReloadRequested` event。
 
 `ReloadRequested` 从 `FileState` 快照 `prev_stat` 并声明 reload effect。handler 开始时投递
-`ReloadStarted`，随后执行 stat：
+`ReloadStarted`，随后先 open 路径，再对已打开的 fd 执行 stat：
 
 ```text
 current_stat == prev_stat
@@ -117,7 +119,8 @@ current_stat != prev_stat
 
 reducer 收到原始字节后，对当前 `S::Data` 调用 `reuse_update`。该方法完成反序列化、校验
 和结构复用，并返回领域数据是否变化。变化时 reducer 再调用 `update_digest`。读取、解析
-或 reuse 失败都只更新错误观察，不替换 last-known-good stat/data。首次启动时
+或 reuse 失败都保留 last-known-good data，但本次 stat 观察仍会更新。后续 reload 继续用
+stat 短路：stat 未变化时保留已有错误但不重复 read，stat 变化后才重新读取。首次启动时
 last-known-good 是合法 empty 数据；因此顶层配置或单个用户意图文件出错都不会使 daemon
 OOS。文件修复后，持续 reload 会自动清除错误并推进有效数据。
 
@@ -314,9 +317,10 @@ fn reuse_packages(
 digest 按 `PackageSpec` 的值计算，不能使用 Arc 地址或引用计数。digest 只用于缩小 previous
 candidate 范围，复用前还必须比较完整 PackageSpec 值，避免摘要碰撞导致错误复用。
 
-reducer 在 `reuse_update` 返回 true 后调用 `update_digest`。对于 UserIntent，该调用只对
-有序的 `PackageSpecItem.digest` 序列做二次 SHA-256，不重新遍历或序列化 PackageSpec。
-返回 false 时不重新计算摘要，也不触发下游领域调谐。
+reducer 在 `reuse_update` 返回 true 后保存旧 digest，再调用 `update_digest`。对于
+UserIntent，该调用只对有序的 `PackageSpecItem.digest` 序列做二次 SHA-256，不重新遍历或
+序列化 PackageSpec。只有新旧 digest 不同时才触发下游领域调谐；返回 false 时不重新计算
+摘要，也不触发下游领域调谐。
 
 ```rust
 struct TopConfigSpec;
@@ -339,6 +343,16 @@ FileState<S: FileSpec> {
 
 LoaderStage = Idle | Submitted | Working
 
+Stat {
+    device: u64,
+    inode: u64,
+    changed: FileTimestamp,
+    modified: FileTimestamp,
+    ty: FileType,
+    len: u64,
+    mode: u32,
+}
+
 FileLoadErrorState {
     at: u64,
     stat: Option<Stat>,
@@ -346,8 +360,12 @@ FileLoadErrorState {
 }
 ```
 
-`stat` 是当前 last-known-good 数据对应的文件状态。只有成功接受新数据时才推进。失败不能
-推进 `stat`，否则后续 reload 可能错误短路，阻止自动恢复。
+`stat` 在 Idle 时是最近一次 stat 观察，不要求对应当前 last-known-good `value`。
+`ReloadRequested` 在声明 effect 前用 `state.stat.take()` 把旧观察移动到 `prev_stat`，因此
+Submitted/Working 期间 state.stat 为 None。completion 总是写回本次观察：stat 成功时为
+`Some(Stat)`，包括后续 read、文件类型校验或 JSON 解析失败的情况；stat 失败时为 `None`。
+Stat 比较包含 device/inode，使 atomic rename 即使保留相同 mtime 和长度也不会被误判为
+原文件；ctime 和 mode 则覆盖 metadata 与权限变化。
 
 `value` 由 FileState 独占，reducer 可以直接调用
 `value.reuse_update(new_bytes)`。Arc 只出现在 `UserIntentData` 的
@@ -478,16 +496,17 @@ daemon 内部生成，不能直接来自不可信输入。
 
 | Stage | 状态变化 | Effect |
 | --- | --- | --- |
-| Idle | stage=Submitted, invalidated=false | `Reload { prev_stat: state.stat }` |
+| Idle | `prev_stat=state.stat.take()`，stage=Submitted，invalidated=false | `Reload { prev_stat }` |
 | Submitted | invalidated=true | 无 |
 | Working | invalidated=true | 无 |
 
 `ReloadStarted` 只允许在 Submitted，迁移到 Working。
 
-handler 必须先投递 `ReloadStarted`，再执行 stat 和可选读取，最后恰好投递一个
-`ReloadFinished`。handler 不解析 JSON，不执行领域校验或结构复用，也不计算 digest。
-`Vec<u8>` 通过 event queue 移动所有权，不要求复制字节内容。同一个 producer 的事件顺序
-必须保持。
+handler 必须先投递 `ReloadStarted`，再 open 目标路径，对已打开的同一个 fd 获取 stat 并
+执行可选读取，最后恰好投递一个 `ReloadFinished`。不能先 stat path 再重新 open path，
+否则 atomic rename 可能使 stat 和读取内容来自不同 inode。handler 不解析 JSON，不执行
+领域校验或结构复用，也不计算 digest。`Vec<u8>` 通过 event queue 移动所有权，不要求复制
+字节内容。同一个 producer 的事件顺序必须保持。
 
 `ReloadFinished` 合法组合：
 
@@ -509,12 +528,13 @@ completion 只允许在 Working，完成后进入 Idle 并清除 invalidated。
 结果应用：
 
 - `data=Some(bytes)`：reducer 调用 `state.value.reuse_update(&bytes)` 解析 JSON。返回
-  `Ok(true)` 时再调用
-  `state.value.update_digest()`，推进 last-known-good stat、清除 error，并触发对应的下游
-  调谐；返回 `Ok(false)` 时仍推进 stat 并清除 error，但不更新 digest，也不触发下游调谐。
+  `Ok(true)` 时保存旧 digest，再调用 `state.value.update_digest()`；仅当新旧 digest 不同时
+  触发对应的下游调谐。返回 `Ok(false)` 时不重新计算 digest。两种成功结果都推进 stat 并
+  清除 error。
 - 读取失败，或 `reuse_update` 在反序列化、校验、结构复用期间返回错误：保留
-  last-known-good stat/value，只替换 error observation。
-- short-circuit：不修改 stat/value/error。
+  last-known-good value，只替换 error observation；若 stat 成功则推进 state.stat。
+- short-circuit：把 handler 返回的 stat 写回 state.stat，不修改 value/error。已有读取错误
+  会继续保留，但相同 stat 不会反复触发相同 read；stat 变化后才重新读取。
 
 反序列化、校验和结构复用是确定性的内存计算，可以在 reducer 中执行。RFC 0002 假定配置文件
 规模足够小，不会长时间阻塞 event loop；如果未来数据规模证明该假设不成立，可以增加
@@ -553,6 +573,13 @@ TopConfig 加载失败只更新 error，当前 subscription roots 不变。
 
 TopConfig 加载成功且 digest 变化时，reducer 用新 subscribe set 替换 WatchList，并声明
 FileWatch reconcile effect。
+
+watcher 实际注册 `config_path` 的父目录，并严格按 basename 过滤事件。只把目标文件的
+`IN_MOVED_TO`、`IN_MOVED_FROM`、`IN_DELETE` 和 `IN_CLOSE_WRITE` 视为变化通知：前三者
+覆盖 atomic replace、移入、移走和 unlink，后者覆盖 inplace write 完成。这样管理员用同
+目录临时文件加 atomic rename 更新配置后，新 inode 仍在已有目录 watch 的覆盖范围内；
+直接覆盖写也会在可写 fd 关闭后触发。普通 create 和 chmod 不提供即时通知保证，只由
+30 秒 fallback 最终发现。watcher 不监听噪声更大且可能暴露半写内容的 `IN_MODIFY`。
 
 ### WatchList 与 subscription GC
 
@@ -642,8 +669,10 @@ AnyEffect 加入 effects JoinSet。
 5. 两类文件使用同一 FileState/FileEvent/FileEffect 状态机。
 6. 每个 FileState 同时最多有一个 reload handler。
 7. LoaderStage 只按 Idle -> Submitted -> Working -> Idle 迁移。
-8. Reload effect 必须携带 reducer 快照的 prev_stat，但不携带 previous Data。
-9. 文件失败不能替换 last-known-good stat/value。
+8. Reload effect 不携带 previous Data；reducer 必须用 state.stat.take() 把旧 stat 移入
+   prev_stat，Submitted/Working 期间 state.stat 为 None。
+9. 文件失败不能替换 last-known-good value；每次 stat 观察都必须替换 state.stat，成功为
+   Some(Stat)，失败为 None。
 10. TopConfig 失败不能撤销 subscription roots。
 11. UserIntent 失败不能撤销该 source 的最后有效贡献。
 12. 只有成功 TopConfig 数据可以改变 WatchList。
@@ -665,6 +694,14 @@ AnyEffect 加入 effects JoinSet。
 23. FileState 直接持有 S::Data；Arc 只用于 PackageSpecItem.spec。
 24. UserIntentData digest 必须由带 domain separation 和 package 数量的有序
     PackageSpecItem digest 序列二次 SHA-256 得到。
+25. loader 必须从同一个已打开 fd 获取 stat 和读取内容，不能组合 path stat 与另一次 open。
+26. file watcher 必须观察目标父目录并按 basename 过滤，使 atomic rename 后的新 inode 仍
+    能被发现。
+27. file watcher 只消费严格匹配目标 basename 的 IN_MOVED_TO、IN_MOVED_FROM、IN_DELETE
+    和 IN_CLOSE_WRITE；其他文件事件不能触发该目标 reload，尤其不能订阅 IN_MODIFY。
+28. stat 或原始 JSON bytes 变化不能直接触发领域调谐；reuse_update 返回 true 后还必须比较
+    更新前后的 digest，只有 digest 变化才能产生下游事件。TopConfig subscribe 的顺序和
+    重复项不具有语义。
 
 ## 验收标准
 
@@ -697,6 +734,11 @@ AnyEffect 加入 effects JoinSet。
     具有自动化测试。
 23. UserIntent digest 的测试覆盖 empty、package 内容变化、顺序变化以及相同子 digest 序列
     的稳定性。
+24. 用同目录临时文件 atomic rename 替换、inplace write、移走或 unlink TopConfig 和
+    UserIntent 时，watcher 都能触发 reload；相邻文件的同类事件不能触发目标 reload，loader
+    返回的 stat 与 bytes 来自同一个 fd。
+25. 用新 inode 替换 TopConfig，但只改变 subscribe 顺序或重复项时，state.stat 前进、digest
+    不变，并且不触发 WatchList reconcile。
 
 ## 与 RFC 0001 的关系
 
@@ -754,7 +796,6 @@ String 足够，并允许未来 shape 复用同一 service。
 - JSON 未知字段应拒绝还是忽略？
 - 未来是否需要支持 JSON 之外的配置格式？
 - canonical encoding 的长期版本化协议是什么？
-- Stat 需要包含 mtime 之外的哪些字段？
 - invalidated completion 的 1 秒、inotify 的 5 秒和 fallback 的 30 秒 timeout 是否需要
   通过 bootstrap 配置？
 - effect task panic 或取消时，如何避免 stage 永久停留在 Submitted/Working？
