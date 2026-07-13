@@ -102,6 +102,16 @@ pub enum FileEvent<S: FileSpec> {
     },
 }
 
+impl<S: FileSpec> FileEvent<S> {
+    pub fn key(&self) -> &S::Key {
+        match self {
+            Self::ReloadRequested { key }
+            | Self::ReloadStarted { key }
+            | Self::ReloadFinished { key, .. } => key,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FileEffect<S: FileSpec> {
     pub key: S::Key,
