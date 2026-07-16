@@ -19,7 +19,7 @@ pub struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            watch_debounce: Duration::from_secs(5),
+            watch_debounce: Duration::from_secs(1),
         }
     }
 }
@@ -318,4 +318,17 @@ fn now_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inotify_debounce_defaults_to_one_second() {
+        assert_eq!(
+            RuntimeOptions::default().watch_debounce,
+            Duration::from_secs(1)
+        );
+    }
 }
